@@ -1,0 +1,21 @@
+# Build
+build/
+.gradle/
+out/
+*.class
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+service-account*.json
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store

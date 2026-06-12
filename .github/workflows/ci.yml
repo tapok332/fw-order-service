@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout service
+        uses: actions/checkout@v4
+        with:
+          path: fw-order-service
+
+      # Services resolve fw-common as a sibling-directory jar
+      # (implementation files('../fw-common/build/libs/...')), so CI
+      # reproduces the same layout the local checkout uses.
+      - name: Checkout fw-common
+        uses: actions/checkout@v4
+        with:
+          repository: tapok332/fw-common
+          path: fw-common
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build fw-common
+        working-directory: fw-common
+        run: ./gradlew build -x test
+
+      - name: Build and test
+        working-directory: fw-order-service
+        run: ./gradlew build
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: fw-order-service/build/reports/tests/test
+          if-no-files-found: ignore

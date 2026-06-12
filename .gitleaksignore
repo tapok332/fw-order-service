@@ -1,0 +1,2 @@
+# Test fixture: fake Stripe clientSecret in a mocked JSON response
+src/test/java/kh/karazin/foodwise/order/client/PaymentServiceClientMoneySerializationTest.java:generic-api-key:145

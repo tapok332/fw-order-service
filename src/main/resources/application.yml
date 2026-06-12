@@ -1,0 +1,110 @@
+server:
+  port: 8086
+
+spring:
+  application:
+    name: order-service
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    # Local default = PostgreSQL superuser created by init-databases.sql.
+    # docker-compose / prod override via SPRING_DATASOURCE_* env vars
+    # (per-service users — see .env.example). See docs/decisions/0008.
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/foodwise_orders}
+    username: ${SPRING_DATASOURCE_USERNAME:tapok332}
+    password: ${SPRING_DATASOURCE_PASSWORD:admin}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: public
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: order-service-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+
+internal:
+  service:
+    secret: ${INTERNAL_SERVICE_SECRET}
+
+foodwise:
+  order:
+    # ISO-4217 code attached to outbox payloads and surfaced in OrderDto.
+    currency: ${ORDER_CURRENCY:UAH}
+    # Lower-case three-letter code Stripe expects on the PaymentIntent.
+    stripe-currency: ${ORDER_STRIPE_CURRENCY:uah}
+    # Mock fulfillment: advance each in-kitchen order one status step per minute
+    # (PROCESSING -> READY -> COMPLETED). PENDING is excluded — orders only move
+    # after payment (Stripe) or, for cash, they start in PROCESSING at creation.
+    # Demo-only; set ORDER_DEMO_AUTO_ADVANCE=false for real fulfillment.
+    demo-auto-advance: ${ORDER_DEMO_AUTO_ADVANCE:true}
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      # Shared defaults across all downstream-service breakers.
+      #
+      # `ignoreExceptions` excludes exceptions that the breaker should NOT count
+      # as failures. Two classes belong here, for two different reasons:
+      #   * HttpClientErrorException — every 4xx from a downstream is a domain
+      #     answer (entity not found, contract drift), never an outage signal.
+      #     The Store/Profile/SurpriseBox clients catch these outside the
+      #     `executeSupplier` boundary (programmatic Resilience4j) and translate
+      #     them to typed FoodWiseException; the original HCE propagates THROUGH
+      #     `executeSupplier` first, so we need to declare it here.
+      #   * FoodWiseException — defence-in-depth. The programmatic clients
+      #     translate downstream errors to typed FoodWiseException OUTSIDE the
+      #     executeSupplier boundary, so in the normal path the breaker never
+      #     sees it. Listing it here guarantees that even if a FoodWiseException
+      #     ever surfaces from inside a supplier (e.g. PaymentServiceClient's
+      #     empty-response 503 guard), a business decline is not miscounted as
+      #     an outage. Phase 8.2 migrated PaymentServiceClient from the
+      #     @CircuitBreaker annotation to the same programmatic pattern, so its
+      #     Stripe 4xx declines (PAYMENT_FAILED / INVALID_REQUEST) are caught as
+      #     HttpClientErrorException before the breaker sees them.
+      # See ADR 0006.
+      default:
+        registerHealthIndicator: true
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 3
+        slidingWindowType: COUNT_BASED
+        ignoreExceptions:
+          - org.springframework.web.client.HttpClientErrorException
+          - kh.karazin.foodwise.common.exception.FoodWiseException
+    instances:
+      storeService:
+        baseConfig: default
+      profileService:
+        baseConfig: default
+      surpriseboxService:
+        baseConfig: default
+      paymentService:
+        baseConfig: default
+
+springdoc:
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:false}
+    tags-sorter: alpha
+    operations-sorter: alpha
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:false}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  pattern:
+    level: "%5p [${spring.application.name:-},%X{requestId:-},%X{userId:-}]"
