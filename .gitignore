@@ -1,7 +1,7 @@
 # Build
 build/
 .gradle/
-out/
+/out/
 *.class
 
 # Secrets — never commit

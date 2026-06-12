@@ -24,51 +24,85 @@ authenticated with `X-Internal-Token`.
 
 ---
 
+## Architecture
+
+The service follows **hexagonal architecture (ports & adapters)** with a separate, framework-free domain model — see [ADR 0014](https://github.com/tapok332/foodwise-platform) for the platform-wide decision.
+
+```
+kh.karazin.foodwise.order/
+├── domain/              # pure Java: Order aggregate, OrderItem, VO ids, enums, ResolvedOrderLine
+│                        #   — status lifecycle, ownership, min-amount and idempotent saga transitions
+├── application/
+│   ├── port/in/         # OrderUseCase, OrderSagaUseCase, AdvanceOrdersUseCase (+ commands/results)
+│   ├── port/out/        # OrderRepository, Store/Profile/SurpriseBox/Payment gateways, OrderEventPublisher
+│   └── usecase/         # OrderService, OrderSagaService, OrderFulfillmentService — @Transactional boundaries
+├── adapter/
+│   ├── in/rest/         # OrderController, InternalOrderController, wire DTOs, explicit OrderRestMapper
+│   ├── in/kafka/        # OrderKafkaConsumer (idempotent saga events)
+│   ├── in/scheduler/    # OrderStatusScheduler (mock-fulfillment cadence + kill switch)
+│   └── out/
+│       ├── persistence/ # JPA entities, Spring Data repos, OrderPersistenceAdapter
+│       ├── client/      # 4 Resilience4j clients + gateway adapters
+│       └── messaging/   # OrderEventPublisherAdapter (transactional outbox)
+└── config/              # Spring wiring: security, Kafka, RestClient, OrderProperties
+```
+
+Layer rules are enforced by [`HexagonalArchitectureTest`](src/test/java/kh/karazin/foodwise/order/architecture/HexagonalArchitectureTest.java) (ArchUnit, runs in `gradlew test` and CI): `domain` depends on no framework and no outer layer (the only sanctioned exception is the shared `Money` value object); `application` talks to the outside world only through ports; `@RestController` / `@KafkaListener` / `@Entity` types exist only in their adapter packages.
+
+Business invariants live in the [`Order`](src/main/java/kh/karazin/foodwise/order/domain/Order.java) aggregate: server-resolved pricing, the minimum-order guard, ownership (`assertVisibleTo` / `cancelBy`), the status lifecycle and the idempotent saga transitions (`markPaid`, `markPaymentFailed`, `expireReservation`). Each status change records a pending history entry that the persistence adapter drains into the audit table on save — so it is impossible to change status without writing history.
+
+---
+
 ## Engineering Highlights
 
 ### Ownership Enforcement / Anti-IDOR
 
 `GET /orders/{orderId}` and `PUT /orders/{orderId}/cancel` both extract the caller's identity from the
-gateway-injected `X-User-Id` header and pass it to `OrderService.getOrderByIdForUser` and `cancelOrder`
-respectively. Both methods load the entity and compare `order.profileId` against the caller; a mismatch throws
-`FORBIDDEN` (HTTP 403), not 404. The internal controller (`InternalOrderController`) uses the separate
-`getOrderByIdUnscoped` method — named deliberately to signal that any new caller must consciously opt in.
+gateway-injected `X-User-Id` header and pass it to `OrderUseCase.getForUser` and `cancel` respectively. The
+[`Order`](src/main/java/kh/karazin/foodwise/order/domain/Order.java) aggregate compares its `profileId` against the
+caller (`assertVisibleTo` / `cancelBy`); a mismatch throws a domain `OrderAccessDeniedException` that the use case
+translates to `FORBIDDEN` (HTTP 403), not 404. The internal controller (`InternalOrderController`) uses the separate
+`getUnscoped` method — named deliberately to signal that any new caller must consciously opt in.
 `OrderControllerSecurityTest` asserts the 403 path as a regression guard.
 
 ### Server-Side Price Recompute
 
 `CreateOrderRequest.items` contains only `{surpriseBoxId, quantity}`. No price or name fields are accepted from the
-client. `OrderService.createOrder` resolves every line item's `title` and `price` (a `Money` value object) from
-`SurpriseBoxServiceClient` before computing the total via `Money.times(quantity).plus(...)`. A missing or incomplete
-box payload causes an immediate 503 — the service refuses to create an order against an unresolvable price rather than
-charge an incorrect amount.
+client. The placement use case (`OrderService.placeOrder`) resolves every line item's `title` and `price` (a `Money`
+value object) through the `SurpriseBoxGateway` port; `Order.place` then computes the total inside the aggregate via
+`Money.times(quantity).plus(...)`. A box that cannot be priced — whether an infra failure or an incomplete payload,
+both collapsed to `null` by the gateway adapter — causes an immediate 503: the service refuses to create an order
+against an unresolvable price rather than charge an incorrect amount.
 
 ### Order-First Stripe Payment Flow
 
-`POST /orders` creates the order entity and, within the same `@Transactional` boundary, calls
-`PaymentServiceClient.createStripeIntent`. The `CreateOrderResponse` record returns `paymentClientSecret` and
+`POST /orders` persists the order and, within the same `@Transactional` boundary, calls the `PaymentGateway`
+port (`createStripeIntent`). The `CreateOrderResponse` record returns `paymentClientSecret` and
 `paymentIntentId` to the frontend, which calls `stripe.confirmPayment(clientSecret)` directly. If Stripe is
 unavailable the entire transaction rolls back — an order without a PaymentIntent is never persisted. Cash orders skip
 the payment gate and start directly in `PROCESSING`.
 
 ### Event-Driven Status Transitions and DLT
 
-Every status transition writes a row to `order_status_history` and publishes via `OutboxPublisher` through the
-transactional outbox (`outbox_events` table). `KafkaConfig` enables Kafka producer idempotence (`acks=all`,
-`enable.idempotence=true`, `transaction-id-prefix=order-tx-`) and manual offset acknowledgment. Consumers in
-`OrderKafkaConsumer` ack only on success; on failure the `KafkaErrorHandlerConfig` (shared from `fw-common`) retries
+Every status transition is recorded on the `Order` aggregate and drained into `order_status_history` by the
+persistence adapter, while the use case publishes the event through the `OrderEventPublisher` port — implemented by
+`OrderEventPublisherAdapter` over `OutboxPublisher` and the transactional outbox (`outbox_events` table). `KafkaConfig`
+enables Kafka producer idempotence (`acks=all`, `enable.idempotence=true`, `transaction-id-prefix=order-tx-`) and
+manual offset acknowledgment. The `adapter/in/kafka` consumer (`OrderKafkaConsumer`) acks only on success; on failure
+the `KafkaErrorHandlerConfig` (shared from `fw-common`) retries
 and routes poison messages to `<topic>.DLT`. All consumed events go through `IdempotentConsumer`, which deduplicates
 by event ID in the `processed_events` table — redeliveries are silently skipped.
 
 ### Resilient Inter-Service Clients
 
 All four downstream clients (`StoreServiceClient`, `ProfileServiceClient`, `SurpriseBoxServiceClient`,
-`PaymentServiceClient`) use the Resilience4j programmatic API (`circuitBreaker.executeSupplier(...)`) instead of
-annotations. This keeps exception-to-domain mapping in a single linear block:
+`PaymentServiceClient`, all in `adapter/out/client` behind their gateway ports) use the Resilience4j programmatic API
+(`circuitBreaker.executeSupplier(...)`) instead of annotations. This keeps exception-to-domain mapping in a single
+linear block:
 
 - `404` from upstream → typed `FoodWiseException(ENTITY_NOT_FOUND)` — surfaced as HTTP 404 to the caller.
 - Other `4xx` → `FoodWiseException(SERVICE_UNAVAILABLE)` — contract drift, not an outage.
-- Circuit-breaker `OPEN` or any `5xx` / network error → `null` fallback — `OrderService` rejects with 503.
+- Circuit-breaker `OPEN` or any `5xx` / network error → `null` fallback — the placement use case rejects with 503.
 
 `HttpClientErrorException` and `FoodWiseException` are declared in `ignoreExceptions` so that business declines never
 trip the breaker. Four named breaker instances (`storeService`, `profileService`, `surpriseboxService`,
@@ -76,8 +110,8 @@ trip the breaker. Four named breaker instances (`storeService`, `profileService`
 
 ### Money Value Object
 
-`Money` from `fw-common` is embedded in `OrderEntity` and `OrderItemEntity` as two columns each
-(`total_price_amount_minor BIGINT`, `total_price_currency VARCHAR(3)`). All arithmetic (`times`, `plus`) and
+`Money` from `fw-common` is embedded in the `OrderEntity` and `OrderItemEntity` JPA mappings (`adapter/out/persistence`)
+as two columns each (`total_price_amount_minor BIGINT`, `total_price_currency VARCHAR(3)`). All arithmetic (`times`, `plus`) and
 comparisons (min-order-amount guard) operate on minor units to eliminate floating-point error. Jackson 3 serializes
 `Money` as `{"amount":"300.00","currency":"UAH"}`. Every outbox payload carries `Money` end-to-end; no separate
 currency string field exists alongside amounts.
@@ -294,18 +328,24 @@ Requires a running PostgreSQL on `localhost:5432` (database `foodwise_orders`) a
 ## Testing
 
 ```bash
-./mvnw test
+./gradlew test
 ```
 
 Test coverage includes:
 
-- `OrderControllerSecurityTest` — `@WebMvcTest` slice; asserts 403 on IDOR attempt (`getOrderById` cross-user),
-  401/403 on unauthenticated/unprivileged cancel and status-update.
+- `OrderTest` — pure domain unit tests: total computation, min-amount guard, ownership, the status lifecycle and the
+  idempotent saga transitions (no Spring, no mocks).
 - `OrderStatusTest` — state machine unit tests: happy-path chain (`PENDING → PROCESSING → READY → COMPLETED`),
   terminal statuses self-loop, `isTerminal()` correctness.
-- `OrderServiceTest` — service-layer unit tests with mocked clients.
-- `OrderMoneyPersistenceIT` — Testcontainers integration test: `Money` embeds persist and reload correctly.
+- `OrderServiceTest` — use-case unit tests with mocked ports (repository + gateways + event publisher): IDOR
+  ownership, server-side price recompute, the min-amount guard.
+- `OrderControllerSecurityTest` — `@WebMvcTest` slice; asserts 403 on IDOR attempt (`getOrderById` cross-user),
+  401/403 on unauthenticated/unprivileged cancel and status-update.
+- `HexagonalArchitectureTest` — ArchUnit layer rules (domain purity, no application→adapter dependency, annotations
+  confined to their adapter packages).
+- `OrderMoneyPersistenceIT` — Testcontainers integration test: a domain order saved through the repository port
+  round-trips its `Money` columns and computed total.
 - `StoreServiceClientTest`, `ProfileServiceClientTest`, `SurpriseBoxServiceClientTest`,
-  `PaymentServiceClientTest`, `PaymentServiceClientMoneySerializationTest`,
-  `PaymentServiceClientErrorClassificationTest` — Resilience4j 4xx/5xx mapping.
+  `PaymentServiceClientMoneySerializationTest`, `PaymentServiceClientErrorClassificationTest` — Resilience4j 4xx/5xx
+  mapping; `SurpriseBoxGatewayAdapterTest` — incomplete-payload collapse.
 
