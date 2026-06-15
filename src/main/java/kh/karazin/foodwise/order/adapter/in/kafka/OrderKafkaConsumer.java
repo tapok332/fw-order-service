@@ -53,6 +53,16 @@ class OrderKafkaConsumer {
     public void onSurpriseBoxReserved(@Payload DomainEvent<Object> event, Acknowledgment ack) {
         idempotentConsumer.processIfNew(event.eventId(), event.eventType(), () -> {
             var payload = objectMapper.convertValue(event.payload(), BoxReservedPayload.class);
+            // TODO(reserve-then-order saga): surprise-box reservations are currently
+            // profile-scoped, not order-scoped — the publisher always sends orderId=null
+            // and there is no reservation→order link yet. Skip such events instead of
+            // failing on a null OrderId (would otherwise NPE → DLT). When the
+            // reserve-then-order flow is built, surprisebox will populate orderId and
+            // these events will flow through to the saga unchanged.
+            if (payload.orderId() == null) {
+                log.debug("surprise-box.reserved without orderId (standalone reservation) — skipping");
+                return;
+            }
             sagaUseCase.onSurpriseBoxReserved(
                     new OrderId(payload.orderId()), new SurpriseBoxId(payload.boxId()), payload.quantity());
         });
@@ -63,6 +73,13 @@ class OrderKafkaConsumer {
     public void onReservationExpired(@Payload DomainEvent<Object> event, Acknowledgment ack) {
         idempotentConsumer.processIfNew(event.eventId(), event.eventType(), () -> {
             var payload = objectMapper.convertValue(event.payload(), ReservationExpiredPayload.class);
+            // TODO(reserve-then-order saga): see onSurpriseBoxReserved. Until reservations
+            // are linked to orders the publisher sends orderId=null; skip rather than
+            // NPE → DLT. Wiring orderId later re-enables order cancellation on expiry.
+            if (payload.orderId() == null) {
+                log.debug("reservation.expired without orderId (standalone reservation) — skipping");
+                return;
+            }
             sagaUseCase.onReservationExpired(
                     new OrderId(payload.orderId()), new SurpriseBoxId(payload.boxId()));
         });
