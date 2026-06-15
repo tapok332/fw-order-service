@@ -23,13 +23,12 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Guards the reserve-then-order saga consumers against {@code orderId == null}.
+ * Reserve-then-order saga consumers (ADR 0015).
  *
- * <p>Surprise-box reservations are currently profile-scoped: the publisher always
- * sends {@code orderId=null} and there is no reservation→order link yet. The
- * consumers must skip such events rather than wrap a null in {@code OrderId}
- * (which would NPE → DLT). When the reserve-then-order flow is built and
- * {@code orderId} is populated, events flow through to the saga unchanged.
+ * <p>Order-driven reservations carry an {@code orderId} and flow through to the
+ * saga. Standalone (profile-scoped) {@code /reserve} reservations still emit
+ * {@code orderId=null}; those events must be skipped rather than wrap a null in
+ * {@code OrderId} (which would NPE → DLT). Both paths are covered here.
  */
 @ExtendWith(MockitoExtension.class)
 class OrderKafkaConsumerTest {

@@ -200,6 +200,17 @@ class OrderTest {
             assertThat(order.status()).isEqualTo(OrderStatus.CANCELLED);
             assertThat(order.expireReservation()).isFalse();
         }
+
+        @Test
+        @DisplayName("expireReservation never cancels an already-PAID order (stale expiry, ADR 0015)")
+        void expireReservation_isNoOpForPaidOrder() {
+            Order order = pendingOrder();
+            order.markPaid();
+
+            assertThat(order.expireReservation()).isFalse();
+            assertThat(order.status()).isEqualTo(OrderStatus.PROCESSING);
+            assertThat(order.paymentStatus()).isEqualTo(OrderPaymentStatus.PAID);
+        }
     }
 
     @Nested

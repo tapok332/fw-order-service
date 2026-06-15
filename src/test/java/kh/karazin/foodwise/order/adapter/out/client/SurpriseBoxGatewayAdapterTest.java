@@ -1,8 +1,11 @@
 package kh.karazin.foodwise.order.adapter.out.client;
 
+import kh.karazin.foodwise.common.dto.internal.InternalReservationDto;
 import kh.karazin.foodwise.common.dto.internal.InternalSurpriseBoxDto;
 import kh.karazin.foodwise.common.money.Money;
 import kh.karazin.foodwise.order.application.port.out.SurpriseBoxGateway;
+import kh.karazin.foodwise.order.domain.OrderId;
+import kh.karazin.foodwise.order.domain.ProfileId;
 import kh.karazin.foodwise.order.domain.SurpriseBoxId;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -64,5 +67,34 @@ class SurpriseBoxGatewayAdapterTest {
                 boxId, "Box title", /* price = */ null, 10, null, null, null));
 
         assertThat(adapter.resolve(new SurpriseBoxId(boxId))).isNull();
+    }
+
+    @Test
+    @DisplayName("reserve returns true when the client confirms the reservation")
+    void reserve_trueOnConfirmedReservation() {
+        UUID boxId = UUID.randomUUID();
+        UUID orderId = UUID.randomUUID();
+        UUID profileId = UUID.randomUUID();
+        when(surpriseBoxServiceClient.reserveBox(boxId, orderId, profileId)).thenReturn(
+                new InternalReservationDto(UUID.randomUUID(), boxId, orderId, java.time.Instant.now()));
+
+        boolean reserved = adapter.reserve(
+                new SurpriseBoxId(boxId), new OrderId(orderId), new ProfileId(profileId));
+
+        assertThat(reserved).isTrue();
+    }
+
+    @Test
+    @DisplayName("reserve returns false when the client signals an infra failure (null)")
+    void reserve_falseOnInfraFailure() {
+        UUID boxId = UUID.randomUUID();
+        UUID orderId = UUID.randomUUID();
+        UUID profileId = UUID.randomUUID();
+        when(surpriseBoxServiceClient.reserveBox(boxId, orderId, profileId)).thenReturn(null);
+
+        boolean reserved = adapter.reserve(
+                new SurpriseBoxId(boxId), new OrderId(orderId), new ProfileId(profileId));
+
+        assertThat(reserved).isFalse();
     }
 }

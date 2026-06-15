@@ -39,6 +39,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -195,6 +196,8 @@ class OrderServiceTest {
             Money expectedTotal = unitPrice.times(2);
             when(surpriseBoxGateway.resolve(boxId))
                     .thenReturn(new SurpriseBoxGateway.ResolvedBox("Box S", unitPrice));
+            // STRIPE orders hold stock before charging (ADR 0015).
+            when(surpriseBoxGateway.reserve(eq(boxId), any(OrderId.class), eq(owner))).thenReturn(true);
             when(paymentGateway.createStripeIntent(any(OrderId.class), any(ProfileId.class),
                     eq(expectedTotal), any(String.class)))
                     .thenReturn(new PaymentGateway.PaymentIntent("pi_fake", "pi_fake_secret"));
@@ -203,8 +206,28 @@ class OrderServiceTest {
 
             verify(paymentGateway).createStripeIntent(any(OrderId.class), any(ProfileId.class),
                     eq(expectedTotal), any(String.class));
+            verify(surpriseBoxGateway).reserve(eq(boxId), any(OrderId.class), eq(owner));
             assertThat(result.order().totalPrice()).isEqualTo(expectedTotal);
             assertThat(result.paymentClientSecret()).isEqualTo("pi_fake_secret");
+        }
+
+        @Test
+        @DisplayName("STRIPE order: out-of-stock reservation rejects the order before charging")
+        void stripeOrder_rejectsWhenReservationOutOfStock() {
+            ProfileId owner = new ProfileId(UUID.randomUUID());
+            SurpriseBoxId boxId = new SurpriseBoxId(UUID.randomUUID());
+            when(surpriseBoxGateway.resolve(boxId))
+                    .thenReturn(new SurpriseBoxGateway.ResolvedBox("Box S", Money.ofMinor(25000L, UAH)));
+            when(surpriseBoxGateway.reserve(eq(boxId), any(OrderId.class), eq(owner)))
+                    .thenThrow(FoodWiseException.errorWithDescription(
+                            FoodWiseErrorCode.RESOURCE_UNAVAILABLE, "Surprise box out of stock: " + boxId.value()));
+
+            assertThatThrownBy(() -> orderService.placeOrder(owner, command(boxId, 1, PaymentType.STRIPE)))
+                    .isInstanceOf(FoodWiseException.class)
+                    .extracting(e -> ((FoodWiseException) e).getErrorDetails().message())
+                    .isEqualTo(FoodWiseErrorCode.RESOURCE_UNAVAILABLE.getMessage());
+
+            verify(paymentGateway, never()).createStripeIntent(any(), any(), any(), any());
         }
     }
 

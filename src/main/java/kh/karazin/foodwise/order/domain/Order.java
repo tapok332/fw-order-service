@@ -218,12 +218,15 @@ public class Order {
 
     /**
      * Cancels the order because its surprise-box reservation expired. No-op for
-     * terminal orders.
+     * terminal orders and for already-PAID orders: once payment is secured a stale
+     * expiry must not cancel the order (guards the narrow race between
+     * {@code payment.completed} and {@code order.completed}, ADR 0015).
      *
      * @return {@code true} if the order transitioned, {@code false} otherwise
      */
     public boolean expireReservation() {
-        if (status == OrderStatus.CANCELLED || status == OrderStatus.COMPLETED) {
+        if (status == OrderStatus.CANCELLED || status == OrderStatus.COMPLETED
+                || paymentStatus == OrderPaymentStatus.PAID) {
             return false;
         }
         status = OrderStatus.CANCELLED;

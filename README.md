@@ -76,11 +76,15 @@ against an unresolvable price rather than charge an incorrect amount.
 
 ### Order-First Stripe Payment Flow
 
-`POST /orders` persists the order and, within the same `@Transactional` boundary, calls the `PaymentGateway`
-port (`createStripeIntent`). The `CreateOrderResponse` record returns `paymentClientSecret` and
-`paymentIntentId` to the frontend, which calls `stripe.confirmPayment(clientSecret)` directly. If Stripe is
-unavailable the entire transaction rolls back — an order without a PaymentIntent is never persisted. Cash orders skip
-the payment gate and start directly in `PROCESSING`.
+`POST /orders` persists the order and, within the same `@Transactional` boundary, **reserves the box(es)** in
+surprise-box-service via the `SurpriseBoxGateway.reserve` port (holding stock for the order awaiting payment,
+[ADR 0015](../docs/decisions/0015-reserve-then-order-saga.md)), then calls the `PaymentGateway` port
+(`createStripeIntent`). The `CreateOrderResponse` record returns `paymentClientSecret` and `paymentIntentId` to the
+frontend, which calls `stripe.confirmPayment(clientSecret)` directly. An out-of-stock box rejects the order before any
+charge; if Stripe is unavailable the entire transaction rolls back — an order without a PaymentIntent is never
+persisted (an orphaned reservation self-heals via the 15-minute expiry). If the reservation expires before payment is
+secured, surprise-box-service emits `reservation.expired` and the saga cancels the order. Cash orders skip the payment
+gate and the reservation, and start directly in `PROCESSING`.
 
 ### Event-Driven Status Transitions and DLT
 
@@ -141,10 +145,13 @@ sequenceDiagram
     Note over OS: Recompute total server-side
     Note over OS: Enforce minOrderAmount guard
 
+    OS->>OS: persist order (mint orderId)
+    OS->>PBS: POST /internal/surprise-boxes/{boxId}/reserve (orderId, profileId)
+    Note over PBS: order-linked reservation holds stock<br/>(out-of-stock → 409 → order rejected)
     OS->>PAY: POST /internal/payments/stripe/intent (orderId, profileId, Money total)
     PAY-->>OS: {paymentIntentId, clientSecret}
 
-    OS->>OS: persist order + outbox event (same @Transactional)
+    OS->>OS: attach intent + outbox order.created (same @Transactional)
     OS-->>Gateway: 201 {order, clientSecret, paymentIntentId}
     Gateway-->>Client: 201 CreateOrderResponse
 
@@ -155,7 +162,9 @@ sequenceDiagram
     Kafka->>OS: OrderKafkaConsumer.onPaymentCompleted
     OS->>OS: paymentStatus=PAID, status=PROCESSING
     OS->>OS: outbox: order.completed event
-    OS->>Kafka: order.completed (consumed by surprisebox-service)
+    OS->>Kafka: order.completed (surprisebox marks reservation COMPLETED)
+
+    Note over OS,PBS: If payment not secured in 15 min:<br/>surprisebox reservation.expired(orderId) → saga cancels order
 
     Note over OS: OrderStatusScheduler (every 60s)<br/>PROCESSING→READY→COMPLETED
     OS->>Kafka: order.status-changed per step
@@ -224,8 +233,8 @@ sequenceDiagram
 |-------|---------|--------|
 | `payment.completed` | `OrderKafkaConsumer.onPaymentCompleted` | Mark PAID, move to PROCESSING, publish `order.completed` |
 | `payment.failed` | `OrderKafkaConsumer.onPaymentFailed` | Mark FAILED, cancel order, publish `order.cancelled` |
-| `surprise-box.reserved` | `OrderKafkaConsumer.onSurpriseBoxReserved` | Log reservation (no state change in happy path) |
-| `reservation.expired` | `OrderKafkaConsumer.onReservationExpired` | Cancel order, publish `order.cancelled` |
+| `surprise-box.reserved` | `OrderKafkaConsumer.onSurpriseBoxReserved` | Log reservation (placement reserved synchronously — informational; `orderId=null` standalone events are skipped) |
+| `reservation.expired` | `OrderKafkaConsumer.onReservationExpired` | Cancel the order if still awaiting payment, publish `order.cancelled` ([ADR 0015](../docs/decisions/0015-reserve-then-order-saga.md); a PAID order is never cancelled by a stale expiry; `orderId=null` standalone events are skipped) |
 
 All consumers are idempotent via `IdempotentConsumer` (deduplication by event ID in `processed_events` table).
 Failed messages retry and route to `<topic>.DLT`.

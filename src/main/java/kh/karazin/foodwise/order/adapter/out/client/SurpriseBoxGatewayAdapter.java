@@ -1,7 +1,10 @@
 package kh.karazin.foodwise.order.adapter.out.client;
 
+import kh.karazin.foodwise.common.dto.internal.InternalReservationDto;
 import kh.karazin.foodwise.common.dto.internal.InternalSurpriseBoxDto;
 import kh.karazin.foodwise.order.application.port.out.SurpriseBoxGateway;
+import kh.karazin.foodwise.order.domain.OrderId;
+import kh.karazin.foodwise.order.domain.ProfileId;
 import kh.karazin.foodwise.order.domain.SurpriseBoxId;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -36,5 +39,15 @@ class SurpriseBoxGatewayAdapter implements SurpriseBoxGateway {
             return null;
         }
         return new ResolvedBox(box.title(), box.price());
+    }
+
+    @Override
+    public boolean reserve(SurpriseBoxId boxId, OrderId orderId, ProfileId profileId) {
+        // null = infrastructure failure (breaker open / 5xx / network) → caller
+        // rejects with 503; no-stock (409) and unknown-box (404) propagate as
+        // typed FoodWiseExceptions from the client.
+        InternalReservationDto reservation =
+                surpriseBoxServiceClient.reserveBox(boxId.value(), orderId.value(), profileId.value());
+        return reservation != null;
     }
 }

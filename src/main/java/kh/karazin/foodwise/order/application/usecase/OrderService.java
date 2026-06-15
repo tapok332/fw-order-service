@@ -31,8 +31,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Application service orchestrating user- and admin-driven order use cases.
@@ -90,6 +92,12 @@ class OrderService implements OrderUseCase {
         String paymentClientSecret = null;
         String paymentIntentId = null;
         if (paymentType == PaymentType.STRIPE) {
+            // Hold stock before charging: the order-linked reservation expires and
+            // cancels the order if payment is not secured in time (ADR 0015). An
+            // out-of-stock / unknown box rejects the order before any intent; a
+            // reservation orphaned by a later rollback self-heals via expiry.
+            reserveBoxes(order, profileId, command);
+
             PaymentGateway.PaymentIntent intent = paymentGateway.createStripeIntent(
                     order.id(), profileId, order.totalPrice(), "Order " + order.id().value());
             order.attachStripeIntent(intent.paymentIntentId());
@@ -131,6 +139,28 @@ class OrderService implements OrderUseCase {
                     return new ResolvedOrderLine(line.boxId(), box.title(), box.price(), line.quantity());
                 })
                 .toList();
+    }
+
+    /**
+     * Reserves each distinct box of the order in surprise-box-service, holding
+     * stock for the order awaiting payment (ADR 0015). A box that cannot be
+     * reserved because the downstream is unhealthy rejects the order with a
+     * generic 503; an out-of-stock (409) or unknown box (404) propagates as the
+     * gateway's typed failure. Any failure rolls back the order transaction.
+     */
+    private void reserveBoxes(Order order, ProfileId profileId, PlaceOrderCommand command) {
+        Set<SurpriseBoxId> reserved = new LinkedHashSet<>();
+        for (PlaceOrderCommand.Line line : command.items()) {
+            if (!reserved.add(line.boxId())) {
+                continue;
+            }
+            if (!surpriseBoxGateway.reserve(line.boxId(), order.id(), profileId)) {
+                log.warn("Order {} rejected: reservation unavailable for box {}",
+                        order.id().value(), line.boxId().value());
+                throw FoodWiseException.errorWithDescription(
+                        FoodWiseErrorCode.SERVICE_UNAVAILABLE, "Reservation unavailable, please retry");
+            }
+        }
     }
 
     @Override

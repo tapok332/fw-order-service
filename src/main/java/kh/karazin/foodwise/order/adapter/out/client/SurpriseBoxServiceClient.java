@@ -3,6 +3,8 @@ package kh.karazin.foodwise.order.adapter.out.client;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import kh.karazin.foodwise.common.dto.internal.InternalReservationDto;
+import kh.karazin.foodwise.common.dto.internal.InternalReserveBoxRequest;
 import kh.karazin.foodwise.common.dto.internal.InternalSurpriseBoxDto;
 import kh.karazin.foodwise.common.exception.FoodWiseErrorCode;
 import kh.karazin.foodwise.common.exception.FoodWiseException;
@@ -62,6 +64,43 @@ class SurpriseBoxServiceClient {
             return null;
         } catch (RestClientException e) {
             log.warn("surprise-box upstream failure for {}: {}", boxId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Reserves a box for an order awaiting payment (ADR 0015). Returns the
+     * reservation on success, or {@code null} on an infrastructure failure
+     * (breaker OPEN / 5xx / network) so the placement use case can reject the
+     * order with "Reservation unavailable, please retry". A 409 (no stock) and a
+     * 404 (unknown box) surface as typed {@link FoodWiseException}s.
+     */
+    InternalReservationDto reserveBox(UUID boxId, UUID orderId, UUID profileId) {
+        try {
+            return circuitBreaker.executeSupplier(() ->
+                    surpriseBoxRestClient.post()
+                            .uri("/internal/surprise-boxes/{boxId}/reserve", boxId)
+                            .body(new InternalReserveBoxRequest(orderId, profileId))
+                            .retrieve()
+                            .body(InternalReservationDto.class)
+            );
+        } catch (HttpClientErrorException.NotFound e) {
+            throw FoodWiseException.errorWithDescription(
+                    FoodWiseErrorCode.ENTITY_NOT_FOUND, "Surprise box not found: " + boxId);
+        } catch (HttpClientErrorException.Conflict e) {
+            throw FoodWiseException.errorWithDescription(
+                    FoodWiseErrorCode.RESOURCE_UNAVAILABLE, "Surprise box out of stock: " + boxId);
+        } catch (HttpClientErrorException e) {
+            log.warn("surprise-box-service rejected reserveBox({}): status={} body={}",
+                    boxId, e.getStatusCode(), e.getResponseBodyAsString());
+            throw FoodWiseException.errorWithDescription(
+                    FoodWiseErrorCode.SERVICE_UNAVAILABLE,
+                    "surprise-box-service rejected request: " + e.getStatusCode());
+        } catch (CallNotPermittedException e) {
+            log.warn("surprise-box circuit breaker open reserving {}: {}", boxId, e.getMessage());
+            return null;
+        } catch (RestClientException e) {
+            log.warn("surprise-box upstream failure reserving {}: {}", boxId, e.getMessage());
             return null;
         }
     }
